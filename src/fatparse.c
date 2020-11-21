@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <errno.h>
 //https://stackoverflow.com/questions/526430/c-programming-how-to-program-for-unicode
@@ -85,6 +86,19 @@ struct file_record {
 
 #pragma pack(pop)
 
+struct options {
+    char verbose;
+};
+
+/* * * * * * * * * * * * * *
+ *      G L O B A L S      *
+ * * * * * * * * * * * * * */
+struct options opts = {0};
+struct fat12bs bootsect;
+short *fat = (void *)0;
+int    fat_n = 0;
+
+
 void print_lfn(struct long_filename *addr)
 {
     int i;
@@ -104,19 +118,64 @@ void print_lfn(struct long_filename *addr)
     return;
 }
 
-/* something wrong with file offsets... *
- * is there just no offset within the cluster (while should be?) */
-void print_file(struct file_record *frec, short cluster_size)
+
+
+// int inline fat_next_rec(rec)
+// {
+//     return fat[];
+// }
+
+
+
+short last_clus(short clus)
 {
-    int clus_no;
+    if (!clus)
+        return 0;
+
+    while ((short)0xffff != fat[clus]) {
+        clus = fat[clus];
+    }
+    printf(" [+] found last cluster: %#hx\n", clus);
+    return clus;
+}
+
+
+void show_clus_chain(short clus)
+{
+    if (!clus)
+        return;
+
+    printf("   clusters:\n");
+    while (clus != (short)0xffff ) {
+        printf("%#x -> ", clus);
+        clus = fat[clus];
+    }
+    printf("%#6hx [EOF]\n", clus);
+}
+
+
+void print_file(struct file_record *frec,
+                short cluster_size,
+                short sec_per_clus,
+                int fst_data_sect)
+{
+    int clus_no   = ((frec->fst_clus_hi << 16) | frec->fst_clus_lo),
+        base_sect = sec_per_clus * (clus_no-2) + fst_data_sect,
+        tmp;
     printf("  |  name:  \"%.11s\"\n", frec->name);
     printf("  |  size: %i bytes\n",  frec->fsize);
-    clus_no = ((frec->fst_clus_hi << 16) | frec->fst_clus_lo);
-    printf("  | start: %#x (clus %#x)\n", cluster_size * clus_no, clus_no);
-    printf("   \\  end: %#x \n", cluster_size * clus_no + frec->fsize);
+    printf("  |  start:  offset %#8x  sector %#x (clus %#x)\n",
+           base_sect*cluster_size/sec_per_clus, base_sect, clus_no);
+
+    if (opts.verbose)
+        show_clus_chain(clus_no);
+
     if (frec->fsize % cluster_size) {
-        printf(" ~~~ %u bytes available in the trailing block ~~~\n",
-                cluster_size - frec->fsize % cluster_size);
+        tmp = last_clus(clus_no);
+        printf(" ~~~ %u bytes available in the trailing block ~~~\n"
+               "   you can find it in cluster %#x (offset %#x)\n",
+                cluster_size - frec->fsize % cluster_size, tmp,
+                cluster_size/sec_per_clus*((tmp-2)*sec_per_clus + fst_data_sect));
     }
 }
 
@@ -126,17 +185,19 @@ void parse_dir(struct file_record *dir)
     return;
 }
 
-int main()
+int main(int argc, char *argv[])
 {
+    if (argc > 1)
+        opts.verbose = 1;
+
     errno = 0;
-    int i, j;
-    int clus_no = 0;
+    int i, tmp;
+    int first_data_sector, root_dir_clus, root_dir_sectors;
 
     FILE *f = fopen("adams.dd", "r");
     perror("fopen");
 
     /* reading FAT16 boot sector */
-    struct fat12bs bootsect;
     fread(&bootsect, 1, sizeof(struct fat12bs), f);
 
     printf(" ~~~ G E N E R A L   F S   I N F O ~~~\n");
@@ -150,14 +211,29 @@ int main()
     printf("       volume label: \"%.11s\"\n", bootsect.bpb.label);
     printf("          system_id: \"%.8s\"\n", bootsect.bpb.systemid);
     printf("             fsinfo: %#x\n", bootsect.info);
-    printf("   root_dir_sectors: %i\n", 32*bootsect.bpb.root_fd_num/bootsect.bpb.sector_size);
+    printf("   root_dir_sectors: %i\n", root_dir_sectors =
+           32*bootsect.bpb.root_fd_num/bootsect.bpb.sector_size);
 
-    int root_dir_clus = 1 + 2*bootsect.bpb.fat_sectors;
+    /* reading 1st FAT */
+    fseek(f, 512, 0);
+    tmp = bootsect.bpb.fat_sectors * bootsect.bpb.sector_size;
+    fat_n = tmp/sizeof(short);
+    fat = malloc(tmp);
+    fread(fat, 1, tmp, f);
+
+    /* reading root directory*/
+    root_dir_clus = 1 + 2*bootsect.bpb.fat_sectors;
     printf(" root_dir at sector: %i (offset %#x)\n", root_dir_clus, root_dir_clus*512);
     fseek(f, root_dir_clus*512, 0);
 
+    first_data_sector = bootsect.bpb.ressects +
+                        bootsect.bpb.fat_count*bootsect.bpb.fat_sectors +
+                        root_dir_sectors;
+    printf(" first_data_sector : %i (offset %#x)\n", first_data_sector, first_data_sector*512);
+
     struct file_record root_dir[bootsect.bpb.root_fd_num-1];
     fread(root_dir, 1, sizeof(root_dir), f);
+
 
     /* Набор LFN-записей каталога FAT всегда должен быть
      * связан с обычной SFN-записью                      */
@@ -172,35 +248,39 @@ int main()
         } else {
             printf(" [+] record ok\n");
         }
-        printf("  |  fst_clus: %#x\n", (/*(root_dir[i].fst_clus_hi << 16) | */root_dir[i].fst_clus_lo));
+        printf("  |  fst_clus: %#x\n", (root_dir[i].fst_clus_lo));
 
         switch (root_dir[i].attr) {
-            case (ATTR_VOLUME_ID | ATTR_ARCHIVE):
-                printf("  |  found volume label record\n");
-                printf("   \\ name: \"%.11s\"\n", root_dir[i].name);
-                break;
+        case (ATTR_VOLUME_ID | ATTR_ARCHIVE):
+            printf("  |  found volume label record\n");
+            printf("  |  name: \"%.11s\"\n", root_dir[i].name);
+            break;
 
-            case (ATTR_RO | ATTR_HIDDEN | ATTR_SYSTEM | ATTR_VOLUME_ID):
-#ifdef VERBOSE
-                printf("  |  lfn (ord %#x)\n     \"", 0xff&((struct long_filename *)(&root_dir[i]))->LDIR_ord);
+        case (ATTR_RO | ATTR_HIDDEN | ATTR_SYSTEM | ATTR_VOLUME_ID):
+            if (opts.verbose) {
+                printf("  |  lfn (ord %#x)\n   | \"", 0xff&((struct long_filename *)(&root_dir[i]))->LDIR_ord);
                 print_lfn((struct long_filename *)&root_dir[i]);
                 printf("\"\n");
-#endif
-                break;
+            }
+            break;
 
-            case ATTR_DIRECTORY:
-                printf("  |  directory\n");
-                printf("   \\ name: \"%.11s\"\n", root_dir[i].name);
-                parse_dir(&root_dir[i]);
-                break;
+        case ATTR_DIRECTORY:
+            printf("  |  directory\n");
+            printf("  |  name: \"%.11s\"\n", root_dir[i].name);
+            parse_dir(&root_dir[i]);
+            break;
 
-            default:
-                print_file(&root_dir[i], bootsect.bpb.sector_size*bootsect.bpb.sectincluster);
-                break;
+        default:
+            print_file(&root_dir[i],
+                       bootsect.bpb.sector_size*bootsect.bpb.sectincluster,
+                       bootsect.bpb.sectincluster,
+                       first_data_sector);
+            break;
         }
     }
 
-    errno=0;
+    errno = 0;
+    free(fat);
     fclose(f);
     perror("fclose");
     return 0;
