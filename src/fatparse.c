@@ -1,3 +1,9 @@
+/* * * * * * * *
+ * TODO:       *
+ * REFACTOR!!1 *
+ * * * * * * * */
+
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -141,15 +147,15 @@ void write2slacks()
     char *buf;
     printf("choose space to write to [0-%i]: ", slack_n - 1);
     scanf("%d%*c", &choice);
-    if (choice >= slack_n) {
-        printf("wrong choice...\n");
-        return;
+    while (choice >= slack_n || choice < 0) {
+        printf("[0-%i] ", slack_n - 1);
+        scanf("%d%*c", &choice);
     }
 
     freopen((char*)0, "r+", f);
     perror("freopen");
-    off = slack[choice].offset + bootsect.bpb.sector_size *
-             bootsect.bpb.sectincluster - slack[choice].length;
+    off = bootsect.bpb.sector_size * bootsect.bpb.sectincluster +
+               slack[choice].offset - slack[choice].length;
     fseek(f, off, 0);
     buf = malloc(slack[choice].length);
 
